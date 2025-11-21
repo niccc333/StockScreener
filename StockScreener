@@ -1,0 +1,119 @@
+"""
+
+Downloads daily prices from Yahoo Finance (via yfinance) and computes:
+ - Beta (vs S&P 500 '^GSPC')
+ - Alpha (CAPM intercept, annualized)
+ - Sharpe ratio (annualized)
+
+Timeframe: 2006-01-01 through 2010-12-31 by default.
+"""
+
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import statsmodels.api as sm
+
+def download_adj_close(tickers, start="2006-01-01", end="2010-12-31"):
+    """
+    Download adjusted close prices for tickers list (or single ticker string).
+    Returns a DataFrame of pct_change() returns (daily).
+    """
+    if isinstance(tickers, str):
+        tickers = [tickers]
+    data = yf.download(tickers, start=start, end=end, progress=False, auto_adjust=True)["Close"]
+    # If single ticker, ensure DataFrame
+    if isinstance(data, pd.Series):
+        data = data.to_frame()
+    data.columns = [c if isinstance(c, str) else c[1] for c in data.columns]
+    return data
+
+def compute_daily_returns(price_df):
+    """Compute daily log returns (or simple returns). Here we use simple returns."""
+    returns = price_df.pct_change().dropna(how="all")
+    return returns
+
+def compute_metrics(tickers, start="2006-01-01", end="2010-12-31",
+                    benchmark="^GSPC", rf_annual=0.01, trading_days=252, show_regression=False):
+    """
+    tickers: string or list of tickers (e.g. "AAPL" or ["AAPL","MSFT"])
+    benchmark: benchmark ticker (default S&P500 '^GSPC')
+    rf_annual: annual risk-free rate (default 1%)
+    trading_days: trading days per year for annualization (252)
+    show_regression: if True, print regression summary for each ticker
+    """
+    # Download prices
+    tickers_list = tickers if isinstance(tickers, (list, tuple)) else [tickers]
+    all_tickers = tickers_list + [benchmark]
+    price_df = download_adj_close(all_tickers, start=start, end=end)
+
+    # Check we have benchmark
+    if benchmark not in price_df.columns:
+        raise ValueError(f"Benchmark {benchmark} not available for the chosen dates.")
+
+    # Compute daily returns
+    returns = compute_daily_returns(price_df)
+
+    # Convert annual rf to daily rf (continuous approx or simple)
+    # We'll use simple discrete approx: rf_daily = (1+rf_annual)**(1/trading_days)-1
+    rf_daily = (1 + rf_annual) ** (1.0 / trading_days) - 1.0
+
+    results = []
+    for t in tickers_list:
+        if t not in returns.columns:
+            print(f"Warning: {t} not present in price data (skipping).")
+            continue
+
+        df = returns[[t, benchmark]].dropna()
+        if df.shape[0] < 30:
+            print(f"Warning: {t} has very few overlapping observations ({df.shape[0]} rows).")
+
+        # Excess returns (asset and market)
+        excess_asset = df[t] - rf_daily
+        excess_market = df[benchmark] - rf_daily
+
+        # OLS: excess_asset = alpha_daily + beta * excess_market + eps
+        X = sm.add_constant(excess_market.values)  # adds intercept
+        model = sm.OLS(excess_asset.values, X).fit()
+
+        alpha_daily = model.params[0]  # daily alpha
+        beta = model.params[1]
+
+        # Annualize alpha: alpha_annual = alpha_daily * trading_days
+        alpha_annual = alpha_daily * trading_days
+
+        # Asset mean and std (use asset raw returns for Sharpe numerator/denominator)
+        mean_asset_daily = df[t].mean()
+        std_asset_daily = df[t].std(ddof=1)
+
+        # Sharpe ratio (annualized): (mean - rf) / std * sqrt(trading_days)
+        sharpe_annual = ((mean_asset_daily - rf_daily) / std_asset_daily) * np.sqrt(trading_days)
+
+        results.append({
+            "ticker": t,
+            "beta": float(beta),
+            "alpha_annual": float(alpha_annual),
+            "sharpe_annual": float(sharpe_annual),
+            "n_obs": int(df.shape[0])
+        })
+
+        if show_regression:
+            print(f"\nRegression for {t}:")
+            print(model.summary())
+
+    results_df = pd.DataFrame(results).set_index("ticker")
+    return results_df
+
+if __name__ == "__main__":
+    # Example usage:
+    # Replace or extend tickers list with tickers you want to analyze.
+    tickers_to_check = ["AAPL", "MSFT", "GOOG"]  # <-- change these to whatever tickers you want
+    res = compute_metrics(tickers_to_check,
+                          start="2006-01-01",
+                          end="2010-12-31",
+                          benchmark="^GSPC",
+                          rf_annual=0.01,
+                          trading_days=252,
+                          show_regression=False)
+    pd.set_option("display.float_format", "{:.6f}".format)
+    print("\nMetrics (2006-01-01 to 2010-12-31):")
+    print(res)
