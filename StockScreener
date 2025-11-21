@@ -1,119 +1,158 @@
-"""
-
-Downloads daily prices from Yahoo Finance (via yfinance) and computes:
- - Beta (vs S&P 500 '^GSPC')
- - Alpha (CAPM intercept, annualized)
- - Sharpe ratio (annualized)
-
-Timeframe: 2006-01-01 through 2010-12-31 by default.
-"""
-
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import statsmodels.api as sm
+from datetime import datetime, timedelta
 
-def download_adj_close(tickers, start="2006-01-01", end="2010-12-31"):
+def analyze_stocks(tickers, start_date, end_date):
     """
-    Download adjusted close prices for tickers list (or single ticker string).
-    Returns a DataFrame of pct_change() returns (daily).
+    Analyzes a list of tickers for specific fundamental and technical factors,
+    then ranks them by Sharpe Ratio.
     """
-    if isinstance(tickers, str):
-        tickers = [tickers]
-    data = yf.download(tickers, start=start, end=end, progress=False, auto_adjust=True)["Close"]
-    # If single ticker, ensure DataFrame
-    if isinstance(data, pd.Series):
-        data = data.to_frame()
-    data.columns = [c if isinstance(c, str) else c[1] for c in data.columns]
-    return data
-
-def compute_daily_returns(price_df):
-    """Compute daily log returns (or simple returns). Here we use simple returns."""
-    returns = price_df.pct_change().dropna(how="all")
-    return returns
-
-def compute_metrics(tickers, start="2006-01-01", end="2010-12-31",
-                    benchmark="^GSPC", rf_annual=0.01, trading_days=252, show_regression=False):
-    """
-    tickers: string or list of tickers (e.g. "AAPL" or ["AAPL","MSFT"])
-    benchmark: benchmark ticker (default S&P500 '^GSPC')
-    rf_annual: annual risk-free rate (default 1%)
-    trading_days: trading days per year for annualization (252)
-    show_regression: if True, print regression summary for each ticker
-    """
-    # Download prices
-    tickers_list = tickers if isinstance(tickers, (list, tuple)) else [tickers]
-    all_tickers = tickers_list + [benchmark]
-    price_df = download_adj_close(all_tickers, start=start, end=end)
-
-    # Check we have benchmark
-    if benchmark not in price_df.columns:
-        raise ValueError(f"Benchmark {benchmark} not available for the chosen dates.")
-
-    # Compute daily returns
-    returns = compute_daily_returns(price_df)
-
-    # Convert annual rf to daily rf (continuous approx or simple)
-    # We'll use simple discrete approx: rf_daily = (1+rf_annual)**(1/trading_days)-1
-    rf_daily = (1 + rf_annual) ** (1.0 / trading_days) - 1.0
-
+    
     results = []
-    for t in tickers_list:
-        if t not in returns.columns:
-            print(f"Warning: {t} not present in price data (skipping).")
-            continue
+    risk_free_rate = 0.04  # Assumed 4% annual risk-free rate
+    
+    print(f"Analyzing {len(tickers)} stocks from {start_date} to {end_date}...")
+    print("-" * 60)
 
-        df = returns[[t, benchmark]].dropna()
-        if df.shape[0] < 30:
-            print(f"Warning: {t} has very few overlapping observations ({df.shape[0]} rows).")
+    for ticker in tickers:
+        try:
+            # --- 1. Fetch Data ---
+            stock = yf.Ticker(ticker)
+            
+            # Get Price History (Daily) for Sharpe and Momentum
+            # We fetch a bit extra history before start_date to ensure we have enough for momentum
+            hist_start = (datetime.strptime(start_date, "%Y-%m-%d") - timedelta(days=365)).strftime("%Y-%m-%d")
+            df_prices = stock.history(start=hist_start, end=end_date)
+            
+            if df_prices.empty:
+                print(f"Skipping {ticker}: No price data found.")
+                continue
 
-        # Excess returns (asset and market)
-        excess_asset = df[t] - rf_daily
-        excess_market = df[benchmark] - rf_daily
+            # Ensure index is timezone-naive to avoid comparison errors
+            if df_prices.index.tz is not None:
+                df_prices.index = df_prices.index.tz_localize(None)
 
-        # OLS: excess_asset = alpha_daily + beta * excess_market + eps
-        X = sm.add_constant(excess_market.values)  # adds intercept
-        model = sm.OLS(excess_asset.values, X).fit()
+            # --- 2. Calculate Sharpe Ratio (Rank Metric) ---
+            # Filter for the specific user-requested window for the Sharpe calculation
+            mask = (df_prices.index >= pd.to_datetime(start_date)) & (df_prices.index <= pd.to_datetime(end_date))
+            df_window = df_prices.loc[mask].copy()
+            
+            df_window['Daily_Ret'] = df_window['Close'].pct_change()
+            mean_ret = df_window['Daily_Ret'].mean()
+            std_ret = df_window['Daily_Ret'].std()
+            
+            # Annualize Sharpe: (Mean Daily Ret - Daily Risk Free) / Std Dev * sqrt(252)
+            # Daily Risk Free ~ 4% / 252
+            daily_rf = risk_free_rate / 252
+            if std_ret == 0 or np.isnan(std_ret):
+                sharpe = 0
+            else:
+                sharpe = ((mean_ret - daily_rf) / std_ret) * np.sqrt(252)
 
-        alpha_daily = model.params[0]  # daily alpha
-        beta = model.params[1]
+            # --- 3. Calculate Factor 2: Price Momentum (t-9 to t-1) ---
+            # Resample to Monthly to get t-1 and t-9 easily
+            # 'ME' is Month End. We use the Adjusted Close/Close.
+            df_monthly = df_prices['Close'].resample('ME').last()
+            
+            # We need the last completed month (t-1) and the month 8 months before that (t-9)
+            # This assumes the 'end_date' is roughly 'current' t.
+            if len(df_monthly) >= 10:
+                price_t_minus_1 = df_monthly.iloc[-2] # Last completed month
+                price_t_minus_9 = df_monthly.iloc[-10] # 9 months ago
+                momentum_factor = (price_t_minus_1 / price_t_minus_9) - 1
+            else:
+                momentum_factor = np.nan
 
-        # Annualize alpha: alpha_annual = alpha_daily * trading_days
-        alpha_annual = alpha_daily * trading_days
+            # --- 4. Calculate Factor 1: (Delta Sales) - (Delta Inventory) ---
+            # Fetch Financials (Annual)
+            financials = stock.financials
+            balance_sheet = stock.balance_sheet
+            
+            # We need at least 2 years of data to calculate 'Change'
+            if not financials.empty and not balance_sheet.empty and financials.shape[1] >= 2:
+                # yfinance columns are usually dates, sorted descending (newest first)
+                
+                # Get Revenue (Total Revenue)
+                try:
+                    # Handle different potential keys in yfinance
+                    rev_key = 'Total Revenue' if 'Total Revenue' in financials.index else 'TotalRevenue'
+                    sales_t = financials.loc[rev_key].iloc[0]
+                    sales_t_minus_1 = financials.loc[rev_key].iloc[1]
+                    change_sales = sales_t - sales_t_minus_1
+                except (KeyError, IndexError):
+                    change_sales = 0
+                    sales_t_minus_1 = 0 # Avoid division by zero later if sales missing
 
-        # Asset mean and std (use asset raw returns for Sharpe numerator/denominator)
-        mean_asset_daily = df[t].mean()
-        std_asset_daily = df[t].std(ddof=1)
+                # Get Inventory
+                try:
+                    inv_key = 'Inventory' 
+                    if inv_key in balance_sheet.index:
+                        inv_t = balance_sheet.loc[inv_key].iloc[0]
+                        inv_t_minus_1 = balance_sheet.loc[inv_key].iloc[1]
+                        change_inv = inv_t - inv_t_minus_1
+                    else:
+                        # Service companies might have 0 inventory
+                        change_inv = 0
+                except (KeyError, IndexError):
+                    change_inv = 0
+                    
+                # Calculate Factor as a Percentage of Previous Sales
+                # Formula: (Delta Sales - Delta Inv) / Sales(t-1)
+                if sales_t_minus_1 != 0:
+                    fund_factor = (change_sales - change_inv) / sales_t_minus_1
+                else:
+                    fund_factor = np.nan
+            else:
+                fund_factor = np.nan
 
-        # Sharpe ratio (annualized): (mean - rf) / std * sqrt(trading_days)
-        sharpe_annual = ((mean_asset_daily - rf_daily) / std_asset_daily) * np.sqrt(trading_days)
+            # --- 5. Append Results ---
+            results.append({
+                'Ticker': ticker,
+                'Sharpe Ratio': round(sharpe, 2),
+                '9PMmntm': f"{momentum_factor:.2%}" if pd.notnull(momentum_factor) else "N/A",
+                'S-ChangeInv': f"{fund_factor:.2%}" if pd.notnull(fund_factor) else "N/A",
+            })
+            
+        except Exception as e:
+            print(f"Error processing {ticker}: {e}")
 
-        results.append({
-            "ticker": t,
-            "beta": float(beta),
-            "alpha_annual": float(alpha_annual),
-            "sharpe_annual": float(sharpe_annual),
-            "n_obs": int(df.shape[0])
-        })
+    # Create DataFrame and Sort
+    df_results = pd.DataFrame(results)
+    
+    if not df_results.empty:
+        df_results = df_results.sort_values(by='Sharpe Ratio', ascending=False).reset_index(drop=True)
+    
+    return df_results
 
-        if show_regression:
-            print(f"\nRegression for {t}:")
-            print(model.summary())
+# --- Configuration ---
 
-    results_df = pd.DataFrame(results).set_index("ticker")
-    return results_df
+# 1. Define 20 Tickers (Mix of Tech, Consumer, Finance for variety)
+ticker_list = [
+    "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", 
+    "TSLA", "META", "JPM", "V", "JNJ", 
+    "WMT", "PG", "XOM", "MA", "HD", 
+    "CVX", "MRK", "KO", "PEP", "ABBV"
+]
 
+# 2. Define Dates
+# Using dynamic dates for the example (Last 2 years ending yesterday)
+end_d = datetime.now().strftime("%Y-%m-%d")
+start_d = (datetime.now() - timedelta(days=365*2)).strftime("%Y-%m-%d")
+
+# --- Execution ---
 if __name__ == "__main__":
-    # Example usage:
-    # Replace or extend tickers list with tickers you want to analyze.
-    tickers_to_check = ["AAPL", "MSFT", "GOOG"]  # <-- change these to whatever tickers you want
-    res = compute_metrics(tickers_to_check,
-                          start="2006-01-01",
-                          end="2010-12-31",
-                          benchmark="^GSPC",
-                          rf_annual=0.01,
-                          trading_days=252,
-                          show_regression=False)
-    pd.set_option("display.float_format", "{:.6f}".format)
-    print("\nMetrics (2006-01-01 to 2010-12-31):")
-    print(res)
+    print(f"Running analysis for dates: {start_d} to {end_d}")
+    
+    ranked_df = analyze_stocks(ticker_list, start_d, end_d)
+    
+    print("\n" + "="*80)
+    print("STOCKS RANKED BY SHARPE RATIO")
+    print("9PMmntm     : Price Momentum (Month t-9 to t-1)")
+    print("S-ChangeInv : (Change Sales - Change Inv) / Previous Sales")
+    print("="*80)
+    
+    # Display formatted dataframe
+    pd.set_option('display.max_columns', None)
+    pd.set_option('display.width', 1000)
+    print(ranked_df)
