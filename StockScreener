@@ -1,8 +1,108 @@
 import yfinance as yf
 import pandas as pd
 import numpy as np
+import statsmodels.api as sm
+from scipy import stats
 from datetime import datetime, timedelta
 
+# --- PART 1: THE FAMA-MACBETH REGRESSION (Historical Significance) ---
+def test_factor_significance(tickers, start_date, end_date):
+    print(f"\nRunning Fama-MacBeth Regression on {len(tickers)} stocks...")
+    print("(Testing if Momentum and Volatility historically predict returns)")
+    print("-" * 60)
+
+    # 1. Bulk Download History (Much faster than looping)
+    # We need extra buffer for lag calculations
+    hist_start = (datetime.strptime(start_date, "%Y-%m-%d") - timedelta(days=400)).strftime("%Y-%m-%d")
+    
+    try:
+        data = yf.download(tickers, start=hist_start, end=end_date, progress=False)['Close']
+    except Exception as e:
+        print(f"Data download failed: {e}")
+        return
+
+    # Handle MultiIndex if yfinance returns it
+    if isinstance(data.columns, pd.MultiIndex):
+        data.columns = data.columns.get_level_values(1)
+
+    # 2. Resample to Monthly Frequency
+    # We use Month End ('ME')
+    df_monthly = data.resample('ME').last()
+    
+    # 3. Build the Panel Dataset (Long Format)
+    panel_data = []
+    
+    for ticker in df_monthly.columns:
+        ts = df_monthly[ticker].to_frame(name='price')
+        
+        # Calculate Returns
+        ts['return'] = ts['price'].pct_change()
+        
+        # TARGET: Next Month's Return (Shift back 1)
+        ts['next_month_return'] = ts['return'].shift(-1)
+        
+        # FACTOR 1: Momentum (t-1 / t-9) - 1
+        # Note: We use shift(1) to get t-1, shift(9) to get t-9
+        ts['factor_momentum'] = (ts['price'].shift(1) / ts['price'].shift(9)) - 1
+        
+        # FACTOR 2: Volatility (Rolling 12-month std dev of returns)
+        ts['factor_volatility'] = ts['return'].rolling(12).std()
+        
+        ts['ticker'] = ticker
+        ts['date'] = ts.index
+        
+        # Clean up
+        ts = ts.dropna()
+        panel_data.append(ts)
+
+    # Combine all stocks into one big dataframe
+    df_panel = pd.concat(panel_data)
+
+    # 4. Normalize Factors (Z-Score) per Month
+    factor_cols = ['factor_momentum', 'factor_volatility']
+    
+    def z_score(x):
+        if x.std() == 0: return 0
+        return (x - x.mean()) / x.std()
+
+    for col in factor_cols:
+        df_panel[col] = df_panel.groupby('date')[col].transform(z_score)
+
+    # 5. Run Regression Month by Month
+    coefficients = []
+    
+    # We need at least a few stocks per month to regress
+    for date, group in df_panel.groupby('date'):
+        if len(group) < 5: continue # Skip months with too little data
+            
+        Y = group['next_month_return']
+        X = group[factor_cols]
+        X = sm.add_constant(X) # Add Alpha
+        
+        try:
+            model = sm.OLS(Y, X).fit()
+            coeffs = model.params.to_dict()
+            coeffs['date'] = date
+            coefficients.append(coeffs)
+        except:
+            pass
+
+    # 6. Aggregate and Print Statistics
+    if not coefficients:
+        print("Not enough data to run regression.")
+        return
+
+    coeff_df = pd.DataFrame(coefficients)
+    summary = pd.DataFrame()
+    summary['Premium (Avg Return)'] = coeff_df[factor_cols].mean()
+    summary['t_stat'] = summary['Premium (Avg Return)'] / (coeff_df[factor_cols].std() / np.sqrt(len(coeff_df)))
+    summary['Significant (95%)'] = abs(summary['t_stat']) > 1.96
+    
+    print(summary)
+    print("-" * 60 + "\n")
+
+
+# --- PART 2: YOUR ORIGINAL SCREENER (Current Ranking) ---
 def analyze_stocks(tickers, start_date, end_date):
     """
     Analyzes a list of tickers for specific fundamental and technical factors,
@@ -12,7 +112,7 @@ def analyze_stocks(tickers, start_date, end_date):
     results = []
     risk_free_rate = 0.04  # Assumed 4% annual risk-free rate
     
-    print(f"Analyzing {len(tickers)} stocks from {start_date} to {end_date}...")
+    print(f"Calculating Current Factors for Ranking...")
     print("-" * 60)
 
     for ticker in tickers:
@@ -21,7 +121,6 @@ def analyze_stocks(tickers, start_date, end_date):
             stock = yf.Ticker(ticker)
             
             # Get Price History (Daily) for Sharpe and Momentum
-            # We fetch a bit extra history before start_date to ensure we have enough for momentum
             hist_start = (datetime.strptime(start_date, "%Y-%m-%d") - timedelta(days=365)).strftime("%Y-%m-%d")
             df_prices = stock.history(start=hist_start, end=end_date)
             
@@ -29,12 +128,11 @@ def analyze_stocks(tickers, start_date, end_date):
                 print(f"Skipping {ticker}: No price data found.")
                 continue
 
-            # Ensure index is timezone-naive to avoid comparison errors
+            # Ensure index is timezone-naive
             if df_prices.index.tz is not None:
                 df_prices.index = df_prices.index.tz_localize(None)
 
             # --- 2. Calculate Sharpe Ratio (Rank Metric) ---
-            # Filter for the specific user-requested window for the Sharpe calculation
             mask = (df_prices.index >= pd.to_datetime(start_date)) & (df_prices.index <= pd.to_datetime(end_date))
             df_window = df_prices.loc[mask].copy()
             
@@ -42,8 +140,6 @@ def analyze_stocks(tickers, start_date, end_date):
             mean_ret = df_window['Daily_Ret'].mean()
             std_ret = df_window['Daily_Ret'].std()
             
-            # Annualize Sharpe: (Mean Daily Ret - Daily Risk Free) / Std Dev * sqrt(252)
-            # Daily Risk Free ~ 4% / 252
             daily_rf = risk_free_rate / 252
             if std_ret == 0 or np.isnan(std_ret):
                 sharpe = 0
@@ -51,12 +147,8 @@ def analyze_stocks(tickers, start_date, end_date):
                 sharpe = ((mean_ret - daily_rf) / std_ret) * np.sqrt(252)
 
             # --- 3. Calculate Factor 2: Price Momentum (t-9 to t-1) ---
-            # Resample to Monthly to get t-1 and t-9 easily
-            # 'ME' is Month End. We use the Adjusted Close/Close.
             df_monthly = df_prices['Close'].resample('ME').last()
             
-            # We need the last completed month (t-1) and the month 8 months before that (t-9)
-            # This assumes the 'end_date' is roughly 'current' t.
             if len(df_monthly) >= 10:
                 price_t_minus_1 = df_monthly.iloc[-2] # Last completed month
                 price_t_minus_9 = df_monthly.iloc[-10] # 9 months ago
@@ -65,26 +157,21 @@ def analyze_stocks(tickers, start_date, end_date):
                 momentum_factor = np.nan
 
             # --- 4. Calculate Factor 1: (Delta Sales) - (Delta Inventory) ---
-            # Fetch Financials (Annual)
             financials = stock.financials
             balance_sheet = stock.balance_sheet
             
+            fund_factor = np.nan # Default
+            
             # We need at least 2 years of data to calculate 'Change'
             if not financials.empty and not balance_sheet.empty and financials.shape[1] >= 2:
-                # yfinance columns are usually dates, sorted descending (newest first)
-                
-                # Get Revenue (Total Revenue)
                 try:
-                    # Handle different potential keys in yfinance
                     rev_key = 'Total Revenue' if 'Total Revenue' in financials.index else 'TotalRevenue'
                     sales_t = financials.loc[rev_key].iloc[0]
                     sales_t_minus_1 = financials.loc[rev_key].iloc[1]
                     change_sales = sales_t - sales_t_minus_1
                 except (KeyError, IndexError):
                     change_sales = 0
-                    sales_t_minus_1 = 0 # Avoid division by zero later if sales missing
 
-                # Get Inventory
                 try:
                     inv_key = 'Inventory' 
                     if inv_key in balance_sheet.index:
@@ -92,26 +179,28 @@ def analyze_stocks(tickers, start_date, end_date):
                         inv_t_minus_1 = balance_sheet.loc[inv_key].iloc[1]
                         change_inv = inv_t - inv_t_minus_1
                     else:
-                        # Service companies might have 0 inventory
                         change_inv = 0
                 except (KeyError, IndexError):
                     change_inv = 0
                     
-                # Calculate Factor as a Percentage of Previous Sales
-                # Formula: (Delta Sales - Delta Inv) / Sales(t-1)
-                if sales_t_minus_1 != 0:
-                    fund_factor = (change_sales - change_inv) / sales_t_minus_1
-                else:
-                    fund_factor = np.nan
-            else:
-                fund_factor = np.nan
+                try:
+                    asset_key = 'Total Assets'
+                    if asset_key in balance_sheet.index:
+                        total_assets = balance_sheet.loc[asset_key].iloc[1]
+                    else:
+                        total_assets = 0
+                except (KeyError, IndexError):
+                    total_assets = 0
+
+                if total_assets != 0:
+                    fund_factor = (change_sales - change_inv) / total_assets
 
             # --- 5. Append Results ---
             results.append({
                 'Ticker': ticker,
                 'Sharpe Ratio': round(sharpe, 2),
-                '9PMmntm': f"{momentum_factor:.2%}" if pd.notnull(momentum_factor) else "N/A",
-                'S-ChangeInv': f"{fund_factor:.2%}" if pd.notnull(fund_factor) else "N/A",
+                '9PMmntm': momentum_factor, # Keep numeric for sorting if needed
+                'S-ChangeInv': fund_factor,
             })
             
         except Exception as e:
@@ -122,12 +211,16 @@ def analyze_stocks(tickers, start_date, end_date):
     
     if not df_results.empty:
         df_results = df_results.sort_values(by='Sharpe Ratio', ascending=False).reset_index(drop=True)
+        # Format for display
+        df_display = df_results.copy()
+        df_display['9PMmntm'] = df_display['9PMmntm'].apply(lambda x: f"{x:.2%}" if pd.notnull(x) else "N/A")
+        df_display['S-ChangeInv'] = df_display['S-ChangeInv'].apply(lambda x: f"{x:.2%}" if pd.notnull(x) else "N/A")
+        return df_display
     
-    return df_results
+    return pd.DataFrame()
 
 # --- Configuration ---
 
-# 1. Define 20 Tickers (Mix of Tech, Consumer, Finance for variety)
 ticker_list = [
     "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", 
     "TSLA", "META", "JPM", "V", "JNJ", 
@@ -135,24 +228,25 @@ ticker_list = [
     "CVX", "MRK", "KO", "PEP", "ABBV"
 ]
 
-# 2. Define Dates
-# Using dynamic dates for the example (Last 2 years ending yesterday)
 end_d = datetime.now().strftime("%Y-%m-%d")
 start_d = (datetime.now() - timedelta(days=365*2)).strftime("%Y-%m-%d")
 
 # --- Execution ---
 if __name__ == "__main__":
-    print(f"Running analysis for dates: {start_d} to {end_d}")
     
+    # 1. Run Significance Test (Regression)
+    # Note: We only regress Momentum and Volatility here because 
+    # aligning point-in-time Fundamental data with yfinance is difficult/inaccurate.
+    test_factor_significance(ticker_list, start_d, end_d)
+
+    # 2. Run Current Ranking (Your original logic)
     ranked_df = analyze_stocks(ticker_list, start_d, end_d)
     
-    print("\n" + "="*80)
     print("STOCKS RANKED BY SHARPE RATIO")
     print("9PMmntm     : Price Momentum (Month t-9 to t-1)")
-    print("S-ChangeInv : (Change Sales - Change Inv) / Previous Sales")
+    print("S-ChangeInv : (Change Sales - Change Inv) / Total Assets")
     print("="*80)
     
-    # Display formatted dataframe
     pd.set_option('display.max_columns', None)
     pd.set_option('display.width', 1000)
     print(ranked_df)
