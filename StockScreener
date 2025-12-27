@@ -4,56 +4,54 @@ import numpy as np
 import statsmodels.api as sm
 from scipy import stats
 from datetime import datetime, timedelta
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates  # Added for date formatting
 import warnings
 
- # all factors taken from the global factor study listed below:
- # https://jkpfactors.com/
-
 # --- SILENCE WARNINGS ---
+# Prevents terminal clutter from non-critical library updates
 warnings.simplefilter(action='ignore', category=FutureWarning)
 warnings.simplefilter(action='ignore', category=UserWarning)
 
 # --- CONFIGURATION ---
-# Using the same tickers as your screenshot
+# The basket of stocks for the cross-sectional analysis
 TICKERS = [
     "AMZN", "AAPL", "MSFT", "GOOGL", "META", "TSLA", "NVDA", "JPM", "V", "JNJ",
     "WMT", "PG", "DIS", "MA", "HD", "BAC", "XOM", "PFE", "KO", "CSCO", "ADBE",
     "NFLX", "INTC", "CMCSA", "T", "PEP", "ABNB", "CRM", "ORCL", "COST", "NKE"
 ]
 
-# "BIL" is the SPDR Bloomberg 1-3 Month T-Bill ETF. 
-# "SGOV" is the iShares 0-3 Month Treasury Bond ETF.
-# It is the standard tradable proxy for the Risk-Free Rate.
 RISK_FREE_TICKER = "SGOV" 
 
+# 4 Years lookback for sensitivity analysis
 START_DATE = (datetime.now() - timedelta(days=365*4)).strftime("%Y-%m-%d") 
 END_DATE = datetime.now().strftime("%Y-%m-%d")
 
 def get_financial_factors(ticker):
+    """Fetches fundamental data and calculates accounting-based factors."""
     stock = yf.Ticker(ticker)
-    fin = stock.financials.T
-    bs = stock.balance_sheet.T
-    cf = stock.cashflow.T
+    try:
+        # Fetch financials, balance sheet, and cash flow statements
+        fin = stock.financials.T
+        bs = stock.balance_sheet.T
+        cf = stock.cashflow.T
+    except:
+        return None
     
     dfs = [d for d in [fin, bs, cf] if not d.empty]
     if not dfs: return None
     
+    # Merge all financial data and handle any overlapping columns
     fund_df = pd.concat(dfs, axis=1)
+    fund_df = fund_df.loc[:,~fund_df.columns.duplicated()]
     fund_df.index = pd.to_datetime(fund_df.index)
     fund_df = fund_df.sort_index()
-    
-        # --- FACTORS ---
-            
-    # Fator List:
-    # 1 F_Sales_Inv: Change in Sales minus Change in Inventory (scaled by Assets)
-    # 2 F_Price_High_Inv: Inverted Price to 52-Week High
-    # 3 F_Momentum: Price Momentum (t-1 to t-9)
-    # 4 F_Tax_Surprise: Change in Tax Expense scaled by Assets
-    # 6 F_OCF: Change in Operating Cash Flow scaled by Assets
 
+    # --- FACTOR CALCULATIONS ---
+    # Scaled by lagged total assets to normalize across different company sizes
 
-    # 1. Change Sales minus Change Inventory (scaled by Assets)
-    # Logic: A higher value indicates sales are outpacing inventory buildup (Bullish signal).
+    # 1. F_Sales_Inv (Change Sales minus Change Inventory)
+    # Logic: High value suggests sales growth isn't just stuffing channels/inventory.
     try:
         rev = fund_df['Total Revenue'] if 'Total Revenue' in fund_df else fund_df['TotalRevenue']
         inv = fund_df['Inventory'] if 'Inventory' in fund_df else pd.Series(0, index=fund_df.index)
@@ -66,8 +64,8 @@ def get_financial_factors(ticker):
     except:
         fund_df['F_Sales_Inv'] = np.nan
 
-    # 6. Change in Operating Cash Flow / Assets
-    #Logic: Measures the acceleration of cash generation. Increasing cash flow relative to the firm's asset base is generally a strong quality signal.
+    # 6. F_OCF (Change in Operating Cash Flow / Assets)
+    # Logic: Measures cash generation acceleration relative to company size.
     try:
         ocf = fund_df['Operating Cash Flow'] if 'Operating Cash Flow' in fund_df else fund_df['TotalCashFromOperatingActivities']
         d_ocf = ocf.diff()
@@ -75,9 +73,8 @@ def get_financial_factors(ticker):
     except:
         fund_df['F_OCF'] = np.nan
 
-    # 3. Tax Expense Surprise
-    # Logic: An increase in tax expense often implies higher taxable income, which can be a proxy for genuine profitability that is harder to manipulate than Net Income.
-    # I think it is catching firms that are being made to pay more taxes because of legislation -> lower margins -> bad
+    # 4. F_Tax_Surprise (Tax Expense Surprise)
+    # Logic: Higher tax provision often correlates with higher 'real' taxable earnings.
     try:
         tax = fund_df['Tax Provision'] if 'Tax Provision' in fund_df else fund_df['TaxProvision']
         d_tax = tax.diff()
@@ -88,17 +85,19 @@ def get_financial_factors(ticker):
     return fund_df[['F_Sales_Inv', 'F_OCF', 'F_Tax_Surprise']]
 
 def get_risk_free_returns():
+    """Fetches risk-free rate proxy returns (SGOV)."""
     print(f"Fetching Risk-Free Rate ({RISK_FREE_TICKER})...")
     try:
         df = yf.download(RISK_FREE_TICKER, start=START_DATE, end=END_DATE, progress=False, auto_adjust=False)
-        
+        if df.empty: return pd.DataFrame()
+
         if isinstance(df.columns, pd.MultiIndex):
             try: df = df.xs(RISK_FREE_TICKER, level=1, axis=1)
             except: df = df.iloc[:, :5]
 
-        # Use Adj Close to capture the interest payments (dividends)
         col_name = 'Adj Close' if 'Adj Close' in df.columns else 'Close'
         
+        # 'ME' is Month End. older pandas uses 'M'
         rf_monthly = df[[col_name]].resample('ME').last()
         rf_monthly['Rf'] = rf_monthly[col_name].pct_change().shift(-1)
         
@@ -108,10 +107,11 @@ def get_risk_free_returns():
         return pd.DataFrame()
 
 def build_dataset(tickers):
+    """Combines price data, fundamental factors, and risk-free rates into one panel."""
     rf_df = get_risk_free_returns()
     if rf_df.empty: rf_df = pd.DataFrame(columns=['Rf'])
 
-    print(f"Building Panel Dataset for {len(tickers)} tickers (might take a while)...")
+    print(f"Building Panel Dataset for {len(tickers)} tickers... (takes a while)")
     panel_data = []
     
     for t in tickers:
@@ -129,34 +129,33 @@ def build_dataset(tickers):
 
             df_m = df_price.resample('ME').last()
             
- 
-
-            # 2. INVERTED Price to 52-Week High (Buy the Dip)
-            # Logic: Compares current price to the 52-week high.
-            # Multiplying by -1 "inverts" it: stocks furthest from their high (the "dip") 
-            # get higher scores in this specific model's logic.
+            # --- PRICE BASED FACTORS ---
+            
+            # 2. F_Price_High_Inv (INVERTED Price to 52-Week High)
+            # Logic: Higher scores mean the stock is currently at a larger discount from its high.
             rolling_max = df_price['Close'].rolling(252).max()
             rolling_max_monthly = rolling_max.resample('ME').last()
             df_m['F_Price_High_Inv'] = (df_m['Close'] / rolling_max_monthly) * -1 
 
-            # 3. Momentum (t-1 to t-9)
-            # Logic: Standard "short-term" momentum. 
-            # It measures the return from 9 months ago to 1 month ago.
-            # We shift(1) to avoid "short-term reversal" (the tendency for last week's winners to dip). 
+            # 3. F_Momentum (t-1 to t-9)
+            # Logic: Measures mid-term price trend while skipping the most recent month.
             df_m['F_Momentum'] = (df_m['Close'].shift(1) / df_m['Close'].shift(9)) - 1
 
+            # --- FUNDAMENTAL FACTORS ---
             df_fund = get_financial_factors(t)
             
             if df_fund is not None:
                 df_m = df_m.sort_index()
                 df_fund = df_fund.sort_index()
+                # merge_asof matches monthly price dates to the last known fundamental data
                 df_final = pd.merge_asof(df_m, df_fund, left_index=True, right_index=True, direction='backward')
                 df_final = df_final.ffill(limit=12)
             else:
                 df_final = df_m
                 df_final[['F_Sales_Inv', 'F_OCF', 'F_Tax_Surprise']] = np.nan
 
-            # C. Target: Excess Return
+            # --- RETURNS ---
+            # Calculate next-month return (the target variable)
             df_final['Raw_Ret'] = df_final['Close'].pct_change().shift(-1)
             df_final = df_final.join(rf_df, how='left')
             df_final['Rf'] = df_final['Rf'].fillna(0.0)
@@ -171,26 +170,35 @@ def build_dataset(tickers):
         except:
             continue
 
-    return pd.concat(panel_data).dropna()
+    if not panel_data: return pd.DataFrame()
+    return pd.concat(panel_data)
 
-def run_refined_regression():
-    # Cross-sectional normalization to prevent outliers from skewing results
+def run_analysis_and_plot():
+    """Runs cross-sectional regressions and visualizes factor performance."""
+    # 1. Build Data
     df = build_dataset(TICKERS)
-    if df.empty: return
+    if df.empty: 
+        print("No valid data found.")
+        return
 
     factor_cols = ['F_Price_High_Inv', 'F_Sales_Inv', 'F_OCF', 'F_Momentum', 'F_Tax_Surprise']
     
+    # 2. Cross-Sectional Normalization
+    # Standardizing factors within each month ensures coefficients are comparable
     for col in factor_cols:
         df[col] = df.groupby('Date')[col].transform(lambda x: (x - x.mean()) / x.std())
     
-    df = df.dropna()
+    # 3. Handle Missing Data for Regression
+    # Preserve the month as long as some tickers have full data
+    df_reg = df.dropna(subset=factor_cols + ['Excess_Ret'])
 
-    r_squared_values = []
     coefficients = []
     
-    print(f"\nRunning Regression on {len(df)} observations...")
+    print(f"\nRunning Cross-Sectional Regressions on {len(df_reg)} valid stock-months...")
     
-    for date, group in df.groupby('Date'):
+    # 4. Fama-MacBeth Regression Loop
+    # Runs one regression per month across all available stocks
+    for date, group in df_reg.groupby('Date'):
         if len(group) < 8: continue 
         
         Y = group['Excess_Ret']
@@ -199,38 +207,103 @@ def run_refined_regression():
         
         try:
             model = sm.OLS(Y, X).fit()
-            r_squared_values.append(model.rsquared_adj) 
             coeffs = model.params.to_dict()
             coeffs['Date'] = date
             coefficients.append(coeffs)
         except:
             pass
 
-    if not r_squared_values:
-        print("Not enough valid data points.")
+    if not coefficients:
+        print("Not enough data points for regression.")
         return
 
-    avg_r2 = np.mean(r_squared_values)
-    
     coeff_df = pd.DataFrame(coefficients).set_index('Date')
+    
+    # --- OUTPUT: P-VALUES & TABLES ---
+    pd.set_option('display.float_format', '{:.5f}'.format)
+    pd.set_option('display.max_columns', 10)
+    pd.set_option('display.width', 1000)
+
+    print("\n" + "="*80)
+    print(f"FULL MODEL PERFORMANCE (Average Monthly Premium)")
+    print("="*80)
+    
     stats_df = pd.DataFrame()
-    
     stats_df['Premium'] = coeff_df[factor_cols].mean()
+    
+    # Calculate Statistical Significance (T-Stats and P-Values)
     se = coeff_df[factor_cols].std() / np.sqrt(len(coeff_df))
-    stats_df['t-stat'] = stats_df['Premium'] / se
-    
+    t_stats = stats_df['Premium'] / se
     df_resid = len(coeff_df) - 1
-    stats_df['p-value'] = 2 * (1 - stats.t.cdf(np.abs(stats_df['t-stat']), df=df_resid))
+    stats_df['p-value'] = 2 * (1 - stats.t.cdf(np.abs(t_stats), df=df_resid))
     
-    pd.set_option('display.float_format', '{:.6f}'.format)
-    
-    print("\n" + "="*70)
-    print(f"FULL MODEL PERFORMANCE (Avg Adj R-Squared): {avg_r2:.4f} ({avg_r2*100:.2f}%)")
-    print("="*70)
-    print(f"Risk-Free Ticker Used: {RISK_FREE_TICKER} from {START_DATE} to {END_DATE}")
     print(stats_df)
-    print("-" * 70)
+
+    # --- YEARLY BREAKDOWN (SENSITIVITY) ---
+    years = coeff_df.index.year.unique()
     
+    for year in sorted(years):
+        year_df = coeff_df[coeff_df.index.year == year]
+        if year_df.empty: continue
+        
+        print("\n" + "-"*80)
+        print(f"YEAR: {year} (Observations: {len(year_df)} months)")
+        print("-"*80)
+        
+        y_stats = pd.DataFrame()
+        y_stats['Premium'] = year_df[factor_cols].mean()
+        
+        se_y = year_df[factor_cols].std() / np.sqrt(len(year_df))
+        t_stat_y = y_stats['Premium'] / se_y
+        df_resid_y = len(year_df) - 1
+        
+        if df_resid_y > 0:
+            y_stats['p-value'] = 2 * (1 - stats.t.cdf(np.abs(t_stat_y), df=df_resid_y))
+        else:
+            y_stats['p-value'] = np.nan
+        
+        rolling_6m = year_df[factor_cols].rolling(6).mean()
+        y_stats['Roll_6M_Min'] = rolling_6m.min()
+        y_stats['Roll_6M_Max'] = rolling_6m.max()
+        
+        print(y_stats[['Premium', 'p-value', 'Roll_6M_Min', 'Roll_6M_Max']])
+
+    # --- PLOTTING: PREMIUM EVOLUTION (UPDATED) ---
+    print("\nGenerating Single Graph for All Premiums...")
+    cum_premiums = coeff_df[factor_cols].cumsum()
+    
+    # Create one large figure
+    plt.figure(figsize=(12, 7))
+    
+    # Loop through factors and plot them on the same axis
+    for col in factor_cols:
+        plt.plot(cum_premiums.index, cum_premiums[col], label=col, linewidth=2)
+        
+        # Add a text label at the end of the line for clarity
+        last_date = cum_premiums.index[-1]
+        last_val = cum_premiums[col].iloc[-1]
+        plt.text(last_date, last_val, f" {last_val:.3f}", 
+                 verticalalignment='center', fontweight='bold', fontsize=9)
+
+    # Formatting the Graph
+    plt.axhline(0, color='black', linewidth=1, linestyle='--')
+    plt.title("Cumulative Factor Premiums Over Time", fontsize=14)
+    plt.ylabel("Cumulative Premium")
+    plt.xlabel("Date")
+    plt.legend(loc='upper left', frameon=True)
+    plt.grid(True, alpha=0.3)
+    
+    # --- X-AXIS FORMATTING FOR MONTH/YEAR ---
+    ax = plt.gca()
+    # Format labels as Year-Month (e.g., 2023-01)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+    # Set tick marks to appear every 3 months to avoid overcrowding
+    ax.xaxis.set_major_locator(mdates.MonthLocator(interval=3))
+    # Rotate labels to prevent overlap
+    plt.xticks(rotation=45)
+    
+    plt.tight_layout()
+    plt.show()
 
 if __name__ == "__main__":
-    run_refined_regression()
+    run_analysis_and_plot()
